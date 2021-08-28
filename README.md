@@ -14,4 +14,4 @@ HOW TO RUN CODE:
 3) Select model parameters (`time_step`, `prop_uncert`, `m`, `niterMCMC`, `updatecovMCMC`, `n_walkers`).
 4) Execute the entire code. One can do this piece-by-piece and check for errors, or can run the full analysis and assess the outcome afterward. The final retrieved trends will be plotted at the end, along with relevant statistics for assessing convergence of the MCMC routine. If the model has not converged, the model parameters can be adjusted and the code executed again, iterating until it converges upon the best-fit solution.
 
-An annotated walk-through of this workflow is provided in the attached R Markdown document. 
+An annotated walk-through of this workflow is provided in the attached R Markdown document (`d238U-inverse-model.html`). 
