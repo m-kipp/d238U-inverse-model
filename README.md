@@ -10,7 +10,7 @@ REQUIREMENTS: R (this code was written using v4.0.0), including msir, FME, doPar
 
 HOW TO RUN CODE:
 1) Open the R script (both the .R and .Rmd files work, and both can be opened in R or R Studio).
-2) Set working directory, and read a d238U dataset from that working directory.
+2) Set working directory, and read a d238U dataset from that working directory. Nota bene: ensure that the column names are 'time', 'd238U' and 'err' (should be the 1SD analytical uncertainty).
 3) Select model parameters (time_step, prop_uncert, m, niterMCMC, updatecovMCMC, n_walkers).
 4) Execute the entire code. One can do this piece-by-piece and check for errors, or can run the full analysis and assess the outcome afterward. The final retrieved trends will be plotted at the end, along with relevant statistics for assessing convergence of the MCMC routine. If the model has not converged, the model parameters can be adjusted and the code executed again, iterating until it converges upon the best-fit solution.
 
