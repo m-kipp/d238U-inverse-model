@@ -1,0 +1,411 @@
+---
+title: "d238U inverse model"
+author: Michael Kipp
+date: August 30, 2021
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This R Markdown document walks through the workflow of fitting a d238U dataset using the MCMC routine described in Kipp & Tissot (2021) EPSL. Users are directed to the paper for a full description of the background and rationale. 
+
+## Part I: Getting started
+
+First we'll load a few necessary packages:
+
+```{r packages}
+library(msir)
+library(FME)
+library(doParallel)
+library(LaplacesDemon)
+```
+
+Next we'll set our working directory and read in our dataset:
+
+```{r dataset}
+setwd("/Users/MichaelKipp/Downloads")
+current_dataset=read.csv("jost_2017_Triassic_data.csv",header=T,stringsAsFactors=F)
+
+```
+
+And we'll quickly plot our dataset with a LOESS curve to get a sense for any trends in the data:
+
+```{r loess plot}
+par(mfrow=c(1,1))
+par(mar=c(4,4,1,1))
+par(oma=c(0,0,0,0))
+plot(current_dataset$d238U~current_dataset$time,axes=F,xlab="",ylab="",ylim=c(-1.1,0.3))
+loess_mod=loess.sd(current_dataset$d238U~current_dataset$time,span=0.4,nsigma=2) 
+polygon(c(loess_mod$x,rev(loess_mod$x)),c(loess_mod$upper,rev(loess_mod$lower)),col=rgb(0,0,0.8,0.1),border=F)
+lines(loess_mod$y~loess_mod$x,col="blue")
+arrows(current_dataset$time,current_dataset$d238U+(2*current_dataset$err),current_dataset$time,current_dataset$d238U-(2*current_dataset$err),length=0)
+points(current_dataset$d238U~current_dataset$time,pch=21,bg="white")
+axis(side=1,mgp=c(3,0.5,0),las=1,tck=-0.02)
+axis(side=2,mgp=c(3,0.5,0),las=1,tck=-0.02)
+mtext("time [yr]",side=1,line=2.25)
+mtext(expression(delta^{238}*"U [\u2030]"),side=2,line=2.5)
+box(lwd=1)
+```
+
+#### Model parameters
+
+Now we'll define the parameters for the d238U mass balance model.
+
+These are parameters we'll definitely want to tune: 
+```{r tunable pars}
+time_step=10e3 # size of time-steps; should be at minimum 1e3; must match temporal resolution of data
+prop_uncert=F # propagate uncertainty on terms in mass balance? yes=T, no=F [start no for testing, use yes at end]
+m=6 # number of terms in Fourier series [start low, demonstrate convergence, increase if needed, test convergence again, repeat...]
+niterMCMC=2e6 # number of steps per walker [likely needs to be 10^5-10^6; start at 10^3 and see how long it will take]
+updatecovMCMC=2e3 # number of steps after which covariance matrix is updated (only during burn-in phase) [see table in ReadMe]
+n_walkers=5 # number of parallel walkers deployed [aim for 3-5 in initial tests, 100+ if propagating uncertainty]
+```
+
+These are parameters we might not have to tune if we're lucky: 
+```{r maybe tunable pars}
+amp_limit=2e-5 # range for amplitude terms [decrease if low acceptance persists]
+start=1 # start of frequency terms; 1 for odd harmonics or continuous, 2 for even harmonics [default=1]
+count=2 # spacing of frequency terms; 2 for odd or even harmonics, 1 for continuous [default=2]
+jump_step_1=amp_limit*0.05 # SD of proposal distribution for amplitude terms [default=amp_limit*0.05]
+jump_step_2=0.2 # SD of proposal distribution for log_fanox_0 [default=0.2]
+burninlengthMCMC=niterMCMC-1e3 # number of discarded "burn in" steps [1e3 less than niterMCMC typically works well]
+thin=1 # factor by which final output is "thinned"; 1=no thinning, 10=keep every 10th sample [default=1]
+
+```
+
+These are parameters we'll never have to tune: 
+```{r not tunable pars}
+start_time=min(current_dataset$time) 
+max_time=max(current_dataset$time)+(time_step-start_time)
+a_vals=seq(0,0,length.out=m)
+b_vals=seq(0,0,length.out=m)
+as=paste("a",1:m,sep="")
+bs=paste("b",1:m,sep="")
+names(a_vals)=as
+names(b_vals)=bs
+pars1=c(log_fanox_0=-2.67,a_vals,b_vals) # starting values; gives modern mass balance
+upper=c(0,seq(amp_limit, amp_limit,length=2*m)) # upper limits
+lower=c(-4,seq(-amp_limit,-amp_limit,length=2*m)) # lower limits
+jump=c(jump_step_2,seq(jump_step_1,jump_step_1,length=2*m)) 
+
+```
+
+Here, we define a matrix that equates `d238Usw` and `fanox` at steady state. This matrix is used to generate consistent steady-state scenarios at the beginning of each time series. 
+```{r SS matrix}
+Jriv=0.42e8 # Dunk et al (2002) Chem Geol
+Kanox=1.74e-4 # derived in Kipp & Tissot (2021) EPSL
+Kother=1.88e-6  # derived in Kipp & Tissot (2021) EPSL
+d238Uriv=-0.30 # Tissot et al (2015); Andersen et al (2016) Chem Geol
+Danox=0.6 # widely-used value, see e.g. Zhang et al (2020) GCA
+Dother=0 # widely-used value, see e.g. Zhang et al (2020) GCA
+fanox_seq=10^seq(-5,0,length=1000)
+log_fanox_seq=seq(-5,0,length=1000)
+d238U_SS=d238Uriv-(((Jriv/((Kanox*fanox_seq)+Kother*(1-fanox_seq)))*((Kother*Dother)+(fanox_seq*((Kanox*Danox)-(Kother*Dother)))))/Jriv)
+ss_out=cbind(d238U_SS, log_fanox_seq)
+```
+
+## Part II: Forward model 
+
+In Part I, we uploaded a dataset and set the model parameters. Now we will define the forward model:
+```{r forward model}
+d238U_model=function(pars){
+	derivs=function(time,y,pars){
+		with(as.list(c(pars,y)),{
+			dd238Usw=(Jriv*(d238Uriv-d238Usw)-Kanox*Nsw*(10^log_fanox)*Danox-Kother*Nsw*(1-(10^log_fanox))*Dother)/Nsw
+			dNsw=Jriv-Kanox*Nsw*(10^log_fanox)-Kother*Nsw*(1-(10^log_fanox))	
+			dlog_fanox=if(log_fanox>-0.004){-1e-8} else if(abs(log_fanox)>4){1e-8} else {sum((pars[seq(2,by=1,length.out=m)]*sin(seq(start,length.out=m,by=count)*pi*time/max_time))+(pars[seq(2+m,by=1,length.out=m)]*cos(seq(start,length.out=m,by=count)*pi*time/max_time)))}
+
+			return(list(c(dd238Usw,dNsw,dlog_fanox)))
+		})
+	}
+	
+log_fanox_0=with(as.list(pars),log_fanox_0)
+Nsw_0=with(as.list(pars),Jriv/(Kanox*(10^log_fanox_0)+Kother*(1-(10^log_fanox_0))))
+d238Usw_0=with(as.list(pars),as.numeric((ss_out[ss_out[,2]>=log_fanox_0,])[1]))
+
+y=c(d238Usw=d238Usw_0,Nsw=Nsw_0,log_fanox=log_fanox_0)
+	
+times=seq(start_time,max_time,by=time_step)
+out=ode(y=y,parms=pars,times=times,func=derivs,method="euler")
+		
+as.data.frame(out)
+}
+```
+
+We can check that the forward model works properly by running it with the modern steady-state values (`pars1`) as our input. We should get 3 straight lines (at the modern SS values) for `d238Usw`, `Nsw` and `fanox`.
+```{r run forward model}
+out1=d238U_model(pars=pars1)
+
+mergeout=merge(out1,current_dataset,by="time") 
+start_NLL=round((sum(0.5*log(2*pi*mergeout$err))+sum(na.omit(((mergeout$d238U-mergeout$d238Usw)^2)/(mergeout$err^2)))),digits=1)  # NLL of starting model (modern SS)
+
+par(mfrow=c(3,1))
+par(mar=c(1,1,1,1))
+par(oma=c(4,4,3,1))
+plot(out1$d238Usw~out1$time,type="l",ylim=c(-1.1,0.3),axes=F,xlab="",ylab="")
+arrows(current_dataset$time,current_dataset$d238U+current_dataset$err*2,current_dataset$time,current_dataset$d238U-current_dataset$err*2,length=0)
+points(current_dataset$d238U~current_dataset$time,pch=21,bg="white")
+axis(side=1,tck=-0.02,mgp=c(3,0.5,0),las=1,labels=NA)
+axis(side=2,tck=-0.02,mgp=c(3,0.5,0),las=1)
+box(lwd=1)
+mtext(side=2,line=2.5,expression(delta^{238}*"U [\u2030]"))
+mtext(side=3,line=0.5,"NLL:",at=min(current_dataset$time),adj=0,cex=0.8)
+mtext(side=3,line=0.5,paste(start_NLL),at=max(current_dataset$time),adj=1,cex=0.8)
+plot(out1$Nsw~out1$time,type="l",ylim=c(0,3e13),axes=F,xlab="",ylab="")
+axis(side=1,tck=-0.02,mgp=c(3,0.5,0),las=1,labels=NA)
+axis(side=2,tck=-0.02,mgp=c(3,0.5,0),las=1,at=c(0,10e12,20e12,30e12),labels=c(0,10,20,30))
+box(lwd=1)
+mtext(side=2,line=2.5,expression("N"[sw]*" [Tmol]"))
+plot(100*10^out1$log_fanox~out1$time,type="l",ylim=c(0,100),axes=F,xlab="",ylab="")
+axis(side=1,tck=-0.02,mgp=c(3,0.5,0),las=1)
+axis(side=2,tck=-0.02,mgp=c(3,0.5,0),las=1)
+box(lwd=1)
+mtext(side=1,line=2.5,"time [yr]")
+mtext(side=2,line=2.5,expression(italic("f")[anox]*" [%]"))
+
+```
+
+## Part III: Inverse model
+
+Having defined the forward model, we can now build the MCMC routine that will be used to optimize the forward model fit to the dataset. 
+
+First we need to define the cost function (negative log-likelihood, NLL):
+```{r cost function}
+d238Ucost=function(pars){
+	out1=d238U_model(pars=pars)
+	merged=merge(out1,current_dataset,by="time")
+	NLL=log(2*pi*merged$err)+na.omit(((merged$d238U-merged$d238Usw)^2)/(merged$err^2)) 
+	return(sum(NLL))
+} 
+
+```
+
+Then we'll set up parallel computation so that different walkers (or "chains") can run on different cores:
+```{r create cluster}
+cores=detectCores()
+cl=makeCluster(cores[1]-1)
+registerDoParallel(cl)
+```
+
+And then we can run the MCMC routine:
+```{r MCMC}
+start.time=Sys.time()
+finalMCMC=foreach(i=1:n_walkers,.combine=rbind) %dopar% {
+	
+library(FME)
+
+if(prop_uncert==T){
+	
+Kanox=rnorm(1,1.74e-4,0.655e-4) # derived in Kipp & Tissot (2021) EPSL
+Kother=35.7e6/(19e12*(1-(6.3e6/(19e12*Kanox))))  # derived in Kipp & Tissot (2021) EPSL
+d238Uriv=rnorm(1,-0.30,0.02) # Tissot et al (2015); Andersen et al (2016) Chem Geol
+Danox=rnorm(1,0.6,0.1) # widely-used value, see e.g. Zhang et al (2020) GCA
+Dother=rnorm(1,0,0.025) # widely-used value, see e.g. Zhang et al (2020) GCA
+	
+}
+
+fanox_seq=10^seq(-5,0,length=1000)
+log_fanox_seq=seq(-5,0,length=1000)
+d238U_SS=d238Uriv-(((Jriv/((Kanox*fanox_seq)+Kother*(1-fanox_seq)))*((Kother*Dother)+(fanox_seq*((Kanox*Danox)-(Kother*Dother)))))/Jriv)
+ss_out=cbind(d238U_SS, log_fanox_seq)
+
+curMCMC=modMCMC(f=d238Ucost,p=pars1,niter=niterMCMC,lower=lower,upper=upper,jump=jump,prior=NULL,var0=NULL,wvar0=0.1,updatecov=updatecovMCMC,burninlength=burninlengthMCMC)
+	
+tempMatrix=cbind(curMCMC$par)
+tempMatrix
+
+}
+end.time=Sys.time()
+run.time1=end.time-start.time
+run.time1
+stopCluster(cl)
+```
+
+We can now optionally thin our output to make it more computationally tractable, though in most cases we set `thin` = 1 (retain all samples). We also write the output as a `.csv` file so that it is saved for any future needs. 
+```{r thin}
+thin_count=dim(finalMCMC)[1]/thin
+i=1
+new_out=NULL
+for (i in 1:thin_count){
+	cur_vals=finalMCMC[i*thin,]
+	new_out=rbind(new_out,cur_vals)
+}
+
+write.csv(new_out,"MCMC_out.csv")
+MCMC_out=read.csv("MCMC_out.csv")
+MCMC_out=MCMC_out[,2:dim(MCMC_out)[2]]
+```
+
+We now have posterior parameter distributions that we can iteratively sample in order to generate a reconstructed time series (and uncertainty range) for the variables of interest (`d238Usw`, `Nsw`, `Fanox`, `fanox`):
+```{r sensRange}
+
+start.time=Sys.time()
+
+i=1
+n_reps=1e3 # 1e3 is sufficient for final run; can decrease to 1e2 for testing 
+time_seq=seq(start_time,max_time,by=time_step)
+d238Usw_out=NULL
+Nsw_out=NULL
+fanox_out=NULL
+for (i in 1:n_reps){
+	
+	if(prop_uncert==T){
+	
+	Kanox=rnorm(1,1.74e-4,0.655e-4) # derived in Kipp & Tissot (2021) EPSL
+	Kother=35.7e6/(19e12*(1-(6.3e6/(19e12*Kanox))))  # derived in Kipp & Tissot (2021) EPSL
+	d238Uriv=rnorm(1,-0.30,0.02) # Tissot et al (2015); Andersen et al (2016) Chem Geol
+	Danox=rnorm(1,0.6,0.1) # widely-used value, see e.g. Zhang et al (2020) GCA
+	Dother=rnorm(1,0,0.025) # widely-used value, see e.g. Zhang et al (2020) GCA
+	
+	}
+	
+	fanox_seq=10^seq(-5,0,length=1000)
+	log_fanox_seq=seq(-5,0,length=1000)
+	d238U_SS=d238Uriv-(((Jriv/((Kanox*fanox_seq)+Kother*(1-fanox_seq)))*((Kother*Dother)+(fanox_seq*((Kanox*Danox)-(Kother*Dother)))))/Jriv)
+	ss_out=cbind(d238U_SS, log_fanox_seq)
+	
+	sr1=sensRange(fun=d238U_model,parms=NULL,parInput= MCMC_out,num=1) 
+	d238Usw_sens=sr1[,(length(pars1)+1):(length(pars1)+length(time_seq))]
+	Nsw_sens=sr1[,(length(pars1)+1+length(time_seq)):(length(pars1)+2*length(time_seq))]
+	fanox_sens=sr1[,(length(pars1)+1+2*length(time_seq)):(length(pars1)+3*length(time_seq))]
+	
+	d238Usw_out=rbind(d238Usw_out, d238Usw_sens)
+	Nsw_out=rbind(Nsw_out, Nsw_sens)
+	fanox_out=rbind(fanox_out, fanox_sens)
+}
+
+
+i=1
+d238Usw_quant_out=NULL
+Nsw_quant_out=NULL
+fanox_quant_out=NULL
+
+for (i in 1:length(time_seq)){
+	cur_time=time_seq[i]
+	cur_d238Usw_quant=quantile(na.omit(d238Usw_out[,i]),probs=seq(0.01,1,by=0.01))
+	cur_Nsw_quant=quantile(na.omit(Nsw_out[,i]),probs=seq(0.01,1,by=0.01))
+	cur_fanox_quant=quantile(na.omit(fanox_out[,i]),probs=seq(0.01,1,by=0.01))
+	d238Usw_quant_out=rbind(d238Usw_quant_out, cur_d238Usw_quant)
+	Nsw_quant_out=rbind(Nsw_quant_out, cur_Nsw_quant)
+	fanox_quant_out=rbind(fanox_quant_out, cur_fanox_quant)
+}
+
+
+end.time=Sys.time()
+run.time2=end.time-start.time
+run.time2
+
+```
+
+## Part IV: Plotting recovered d238Usw, Nsw, Fanox and fanox trends
+
+Now we can plot our results. We'll first calculate some statistics that will help us assess whether our run converged on the target distribution:
+```{r diagnostics}
+mcmcout=cbind(time_seq,d238Usw_quant_out[,50])
+colnames(mcmcout)=c("time","d238Usw")
+mergemcmc=merge(mcmcout,current_dataset,by="time") 
+total_NLL=round((sum(0.5*log(2*pi*mergemcmc$err))+sum(na.omit(((mergemcmc$d238U-mergemcmc$d238Usw)^2)/(mergemcmc$err^2)))),digits=1)  # final NLL of median output
+accept_frac=100*round(length(unique(finalMCMC[,1]))/length(finalMCMC[,1]),digits=2) # fraction of steps accepted during random walks
+z=1
+y=1
+auto_out=NULL
+big_auto_out=NULL
+mcmc_list_out=NULL
+for (z in 1:n_walkers){
+	cur_walker_data=finalMCMC[(1+(((niterMCMC-burninlengthMCMC)/thin)*(z-1))):(((niterMCMC-burninlengthMCMC)/thin)*(z)),]
+	
+	y=1
+	for (y in 1:(dim(cur_walker_data)[2]-2)){
+		cur_autocorr=IAT(as.numeric(cur_walker_data[,y]))
+		auto_out=rbind(auto_out,cur_autocorr)
+	}
+	
+	cur_avg_autocorr=mean(auto_out)
+	cur_eff=((niterMCMC-burninlengthMCMC)/thin)/cur_avg_autocorr
+	results=c(cur_avg_autocorr, cur_eff)
+	big_auto_out=rbind(big_auto_out, results)
+	
+	mcmc_results=cbind(cur_walker_data,z)
+	mcmc_list_out=rbind(mcmc_list_out,mcmc_results)
+
+	
+}
+avg_autocorr_MCMC=mean(big_auto_out[,1]) # average integrated autocorrelation time (IAT)
+eff=round(sum(big_auto_out[,2]),digits=0) # effective sample size (total samples/IAT)
+mcmc_out_1=mcmc(mcmc_list_out[mcmc_list_out[,dim(mcmc_list_out)[2]]==1,],thin=thin)
+mcmc_out_1= mcmc_out_1[,1:length(pars1)]
+mcmc_out_2=mcmc(mcmc_list_out[mcmc_list_out[,dim(mcmc_list_out)[2]]==2,],thin=thin)
+mcmc_out_2= mcmc_out_2[,1:length(pars1)]
+mcmc_out_3=mcmc(mcmc_list_out[mcmc_list_out[,dim(mcmc_list_out)[2]]==3,],thin=thin)
+mcmc_out_3= mcmc_out_3[,1:length(pars1)]
+mcmc_out_4=mcmc(mcmc_list_out[mcmc_list_out[,dim(mcmc_list_out)[2]]==4,],thin=thin)
+mcmc_out_4= mcmc_out_4[,1:length(pars1)]
+mcmc_out_5=mcmc(mcmc_list_out[mcmc_list_out[,dim(mcmc_list_out)[2]]==5,],thin=thin)
+mcmc_out_5= mcmc_out_5[,1:length(pars1)]
+mcmc_list=as.mcmc.list(list(mcmc_out_1,mcmc_out_2,mcmc_out_3,mcmc_out_4,mcmc_out_5)) 
+psrf=gelman.diag(mcmc_list,autoburnin=FALSE) # calculating potential scale reduction factor (psrf), i.e. Gelman-Rubin statistic, or Rhat
+avg_psrf=round(mean(psrf$psrf[,1]),digits=2) # average psrf for all variables (gives quick check of convergence; aiming for <<1.2)
+
+```
+
+And finally, we will plot our recovered trends. The median output is shown in the solid black line, with the 16th to 84th percentile region in grey shading:
+```{r final plots}
+par(mfrow=c(4,1))
+par(mar=c(0.5,1,0.5,1))
+par(oma=c(2.5,3.5,5,0))
+plot(current_dataset$d238U~current_dataset$time,ylim=c(-1.1,0.3),cex=0,axes=F,xlab="",ylab="")
+polygon(c(time_seq,rev(time_seq)),c(d238Usw_quant_out[,16],rev(d238Usw_quant_out[,84])),border=F,col="grey80")
+lines(d238Usw_quant_out[,50]~ time_seq,col="black")
+arrows(current_dataset$time,current_dataset$d238U+current_dataset$err*2,current_dataset$time,current_dataset$d238U-current_dataset$err*2,length=0)
+points(current_dataset$d238U~current_dataset$time,pch=21,bg="white",cex=1.0)
+axis(side=2,tck=-0.02,mgp=c(3,0.5,0),las=1,)
+axis(side=1,tck=-0.02,mgp=c(3,0.5,0),las=1,labels=NA)
+mtext(expression(delta^{238}*"U [\u2030]"),side=2,line=2.5,cex=0.9)
+box(lwd=1)
+mtext(side=3,line=3.5,"NLL:",at=min(current_dataset$time),adj=0,cex=0.8)
+mtext(side=3,line=3.5,paste(total_NLL),at=max(current_dataset$time),adj=1,cex=0.8)
+mtext(side=3,line=2.5,"effective sample size:",at=min(current_dataset$time),adj=0,cex=0.8)
+mtext(side=3,line=2.5,paste(eff),at=max(current_dataset$time),col=if((eff>=1000)){"green4"} else if(eff>=100){"orange"} else{"red"},adj=1,cex=0.8)
+mtext(side=3,line=1.5,"fraction accepted:",at=min(current_dataset$time),adj=0,cex=0.8)
+mtext(side=3,line=1.5,paste(accept_frac,"%"),at=max(current_dataset$time),col=if((accept_frac>=10)&(accept_frac<=50)){"green4"} else if((accept_frac<10)&(accept_frac>=5)){"orange"} else if((accept_frac>50)&(accept_frac<=60)){"orange"} else{"red"},adj=1,cex=0.8)
+mtext(side=3,line=0.5,"avg psrf:",at=min(current_dataset$time),adj=0,cex=0.8)
+mtext(side=3,line=0.5,paste(avg_psrf),at=max(current_dataset$time),col=if(avg_psrf<=1.2){"green4"} else if((avg_psrf>1.2)&(avg_psrf<=1.5)){"orange"} else{"red"},adj=1,cex=0.8)
+
+plot(Nsw_quant_out[,50]~time_seq,ylim=c(0,3e13),cex=0,axes=F,xlab="",ylab="")
+polygon(c(time_seq,rev(time_seq)),c((Nsw_quant_out[,16]),rev(Nsw_quant_out[,84])),border=F,col="grey80")
+lines(Nsw_quant_out[,50]~time_seq,col="black")
+axis(side=2,tck=-0.02,mgp=c(3,0.5,0),las=1,at=c(0,10e12,20e12,30e12),labels=c("0","10","20","30"))
+axis(side=1,tck=-0.02,mgp=c(3,0.5,0),las=1,labels=NA)
+mtext(expression("N"[sw]*" [Tmol]"),side=2,line=2.5,cex=0.9)
+box(lwd=1)
+
+plot(10^fanox_quant_out[,4]~time_seq,ylim=c(0,100),cex=0,axes=F,xlab="",ylab="")
+Fanox_quant_out=(10^fanox_quant_out*Kanox)/(10^fanox_quant_out*Kanox+Kother*(1-10^fanox_quant_out))
+polygon(c(time_seq,rev(time_seq)),c((100*Fanox_quant_out[,16]),rev(100*Fanox_quant_out[,84])),border=F,col="grey80")
+lines(100*Fanox_quant_out[,50]~time_seq,col="black")
+axis(side=2,tck=-0.02,mgp=c(3,0.5,0),las=1)
+axis(side=1,tck=-0.02,mgp=c(3,0.5,0),las=1,labels=NA)
+mtext(expression(italic("F")[anox]*" [%]"),side=2,line=2.5,cex=0.9)
+box(lwd=1)
+
+plot(10^fanox_quant_out[,4]~time_seq,ylim=c(0,10),cex=0,axes=F,xlab="",ylab="")
+polygon(c(time_seq,rev(time_seq)),c((100*10^fanox_quant_out[,16]),rev(100*10^fanox_quant_out[,84])),border=F,col="grey80")
+lines(100*10^fanox_quant_out[,50]~time_seq,col="black")
+axis(side=2,tck=-0.02,mgp=c(3,0.5,0),las=1)
+axis(side=1,tck=-0.02,mgp=c(3,0.5,0),las=1)
+mtext(expression(italic("f")[anox]*" [%]"),side=2,line=2.5,cex=0.9)
+mtext("time [yr]",side=1,line=1.75,cex=0.9)
+box(lwd=1)
+
+
+
+```
+
+We've now run the complete inverse model. If we haven't converged on the target distribution for all parameters (i.e., psrf > 1.2), we can first try running for longer (higher `niterMCMC` value), using fewer terms (lower `m` value), or tuning the `updatecovMCMC` value. If convergence is still difficult (at this point, likely also indicated by low acceptance fraction, <<10%), we can shrink the range of possible parameter values (`amp_limit`) by a factor of 2-10. In rare cases, we might also have better luck actually moving to higher `m` values. 
+
+Once convergence is achieved (psrf << 1.2), we can feel confident that the MCMC has found the best fit to the dataset given our parameterization. If the recovered trend does not capture all of the subtleties in the dataset, though, we may consider repeating the calculations with a larger `m` value. This will necessitate a longer run for convergence, but might result in a better fit to the data (lower NLL). Once we are convinced that we've used a high enough `m` value (i.e., NLL no longer decreases with an increase in `m`), we finally want to (1) propagate uncertainty on the terms in the mass balance, and (2) increase our effective sample size (should be able to reach >1000). To do so, switch `prop_uncert` to TRUE and set `n_walkers` to at least 100. This will likely be a very long run! So best to leave the computer overnight, or send this task off to a computing cluster for parallel processing. 
+
+
+For persistent problems, or to report bugs or make suggestions, reach out to Michael Kipp (mkipp@caltech.edu). 
