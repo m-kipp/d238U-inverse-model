@@ -2,9 +2,11 @@
 
 Version 1.0
 
-This `R` code executes the inverse analysis of d238U paleo-redox datasets as described in Kipp & Tissot (2021) EPSL. 
+This `R` code executes the inverse analysis of d238U paleo-redox datasets as described in Kipp & Tissot (2022) EPSL. 
 
-As a matter of courtesy, we request that those using this code please cite Kipp & Tissot (2021). In the interest of an "open source" approach, we also request that authors who use and modify the code please send a copy of papers and modified code to the lead author (mkipp@caltech.edu).
+Link to paper: https://doi.org/10.1016/j.epsl.2021.117240 
+
+As a matter of courtesy, we request that those using this code please cite Kipp & Tissot (2022). In the interest of an "open source" approach, we also request that authors who use and modify the code please send a copy of papers and modified code to the lead author (mkipp@caltech.edu).
 
 REQUIREMENTS: `R` (this code was written using v4.0.0), including `msir`, `FME`, `doParallel` and `LaplacesDemon` packages (and their dependencies).
 
